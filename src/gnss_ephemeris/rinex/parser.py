@@ -8,14 +8,62 @@ GPSEphemeris / BDSEphemeris dataclass 对象列表。
   - 从行尾倒推 D19.12 字段，解决 af0 负号粘连问题
   - 空白 spare 字段返回 0.0
   - 全量解析（非仅第一条）
+  - 注册表模式：新增系统/版本时无需修改本文件
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from typing import Callable
 
 from gnss_ephemeris.rinex.models import Ephemeris, GPSEphemeris, BDSEphemeris
 from gnss_ephemeris.utils.fortran import fortran_d_to_float
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 注册表：版本解析器 & 星历构造器
+# ---------------------------------------------------------------------------
+
+# 版本前缀 → 解析函数 (lines, **kwargs) -> list[Ephemeris]
+_VERSION_PARSERS: dict[str, Callable] = {}
+
+# 系统标识 → (Ephemeris 子类, builder 函数)
+# builder 签名: (common: dict, rows: list[list[float]]) -> Ephemeris
+_EPH_BUILDERS: dict[str, tuple[type[Ephemeris], Callable]] = {}
+
+
+def register_version_parser(version_prefix: str, parser_fn: Callable) -> None:
+    """注册 RINEX 版本解析器.
+
+    Args:
+        version_prefix: 版本前缀，如 "2.", "3.", "4."
+        parser_fn: 解析函数，签名为 (lines, **kwargs) -> list[Ephemeris]
+    """
+    if version_prefix in _VERSION_PARSERS:
+        logger.warning("覆盖已注册的版本解析器: %s", version_prefix)
+    _VERSION_PARSERS[version_prefix] = parser_fn
+
+
+def register_eph_builder(
+    system: str,
+    eph_cls: type[Ephemeris],
+    builder: Callable[[dict, list[list[float]]], Ephemeris],
+) -> None:
+    """注册星历构造器.
+
+    Args:
+        system: 卫星系统标识，如 "GPS", "BDS", "Galileo"
+        eph_cls: 对应的 Ephemeris 子类
+        builder: 构造函数，签名为 (common_fields, rows) -> Ephemeris实例
+                 common_fields: 共享字段的 dict
+                 rows: [row2, row3, row4, row5, row6, row7, row8]
+    """
+    if system in _EPH_BUILDERS:
+        logger.warning("覆盖已注册的星历构造器: %s", system)
+    _EPH_BUILDERS[system] = (eph_cls, builder)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +167,55 @@ def _slice4_r3(line: str) -> list[float]:
     ]
 
 
+def _build_common_fields(
+    system: str, prn: int, epoch: tuple,
+    af0: float, af1: float, af2: float,
+    rows: list[list[float]],
+) -> dict:
+    """从解析行数据构造共享字段 dict."""
+    row2, row3, row4, row5, row6, row7, row8 = rows
+    return dict(
+        system=system, prn=prn, epoch=epoch,
+        af0=af0, af1=af1, af2=af2,
+        toe=row4[0],
+        sqrt_a=row3[3], e=row3[1], m0=row2[3],
+        delta_n=row2[2],
+        omega=row5[2], omega0=row4[2], omega_dot=row5[3],
+        i0=row5[0], idot=row6[0],
+        cuc=row3[0], cus=row3[2],
+        crc=row5[1], crs=row2[1],
+        cic=row4[1], cis=row4[3],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 内置星历构造函数
+# ---------------------------------------------------------------------------
+
+def _build_gps_eph(common: dict, rows: list[list[float]]) -> GPSEphemeris:
+    """构造 GPSEphemeris 对象."""
+    row2, row3, row4, row5, row6, row7, row8 = rows
+    return GPSEphemeris(
+        **common,
+        iode=row2[0], iodc=row7[3], tgd=row7[2],
+        gps_week=row6[2], codes_on_l2=row6[1], l2_p_flag=row6[3],
+        sv_accuracy=row7[0], sv_health=row7[1],
+        trans_time=row8[0], fit_interval=row8[1],
+    )
+
+
+def _build_bds_eph(common: dict, rows: list[list[float]]) -> BDSEphemeris:
+    """构造 BDSEphemeris 对象."""
+    row2, row3, row4, row5, row6, row7, row8 = rows
+    return BDSEphemeris(
+        **common,
+        aode=row2[0], aodc=row8[1],
+        tgd1=row7[2], tgd2=row7[3], sath1=row7[1],
+        bdt_week=row6[2], sv_accuracy=row7[0],
+        trans_time=row8[0],
+    )
+
+
 # ---------------------------------------------------------------------------
 # RINEX 2.x 解析
 # ---------------------------------------------------------------------------
@@ -132,6 +229,9 @@ def parse_rinex2(lines: list[str], system: str = "GPS") -> list[Ephemeris]:
 
     Returns:
         GPSEphemeris 或 BDSEphemeris 对象列表
+
+    Raises:
+        ValueError: 系统未在注册表中注册
     """
     start = _find_end_of_header(lines)
     results: list[Ephemeris] = []
@@ -147,46 +247,18 @@ def parse_rinex2(lines: list[str], system: str = "GPS") -> list[Ephemeris]:
         prn, epoch, af0, af1, af2 = _parse_clock_line_r2(lines[i])
 
         # 解析行2~8
-        row2 = _slice4_r2(lines[i + 1])
-        row3 = _slice4_r2(lines[i + 2])
-        row4 = _slice4_r2(lines[i + 3])
-        row5 = _slice4_r2(lines[i + 4])
-        row6 = _slice4_r2(lines[i + 5])
-        row7 = _slice4_r2(lines[i + 6])
-        row8 = _slice4_r2(lines[i + 7])
+        rows = [_slice4_r2(lines[i + k]) for k in range(1, 8)]
 
-        # 公共字段
-        common = dict(
-            system=system, prn=prn, epoch=epoch,
-            af0=af0, af1=af1, af2=af2,
-            toe=row4[0],
-            sqrt_a=row3[3], e=row3[1], m0=row2[3],
-            delta_n=row2[2],
-            omega=row5[2], omega0=row4[2], omega_dot=row5[3],
-            i0=row5[0], idot=row6[0],
-            cuc=row3[0], cus=row3[2],
-            crc=row5[1], crs=row2[1],
-            cic=row4[1], cis=row4[3],
-        )
+        # 查表构造星历对象
+        if system not in _EPH_BUILDERS:
+            raise ValueError(
+                f"RINEX 2.x 不支持系统: {system}，"
+                f"已注册: {list(_EPH_BUILDERS.keys())}"
+            )
 
-        if system == "GPS":
-            eph = GPSEphemeris(
-                **common,
-                iode=row2[0], iodc=row7[3], tgd=row7[2],
-                gps_week=row6[2], codes_on_l2=row6[1], l2_p_flag=row6[3],
-                sv_accuracy=row7[0], sv_health=row7[1],
-                trans_time=row8[0], fit_interval=row8[1],
-            )
-        elif system == "BDS":
-            eph = BDSEphemeris(
-                **common,
-                aode=row2[0], aodc=row8[1],
-                tgd1=row7[2], tgd2=row7[3], sath1=row7[1],
-                bdt_week=row6[2], sv_accuracy=row7[0],
-                trans_time=row8[0],
-            )
-        else:
-            raise ValueError(f"RINEX 2.x 不支持系统: {system}")
+        common = _build_common_fields(system, prn, epoch, af0, af1, af2, rows)
+        _cls, builder = _EPH_BUILDERS[system]
+        eph = builder(common, rows)
 
         results.append(eph)
         i += 8
@@ -212,6 +284,7 @@ def parse_rinex3(lines: list[str]) -> list[Ephemeris]:
     """解析 RINEX 3.x 导航电文文件，返回全部星历记录.
 
     自动根据 SV 标识（如 G02, C01）识别卫星系统。
+    未在注册表中注册的系统将被跳过。
 
     Args:
         lines: 文件全部行
@@ -237,48 +310,16 @@ def parse_rinex3(lines: list[str]) -> list[Ephemeris]:
         prn = int(sv[1:]) if sv else 0
 
         # 解析行2~8
-        row2 = _slice4_r3(lines[i + 1])
-        row3 = _slice4_r3(lines[i + 2])
-        row4 = _slice4_r3(lines[i + 3])
-        row5 = _slice4_r3(lines[i + 4])
-        row6 = _slice4_r3(lines[i + 5])
-        row7 = _slice4_r3(lines[i + 6])
-        row8 = _slice4_r3(lines[i + 7])
+        rows = [_slice4_r3(lines[i + k]) for k in range(1, 8)]
 
-        # 公共字段
-        common = dict(
-            system=system, prn=prn, epoch=epoch,
-            af0=af0, af1=af1, af2=af2,
-            toe=row4[0],
-            sqrt_a=row3[3], e=row3[1], m0=row2[3],
-            delta_n=row2[2],
-            omega=row5[2], omega0=row4[2], omega_dot=row5[3],
-            i0=row5[0], idot=row6[0],
-            cuc=row3[0], cus=row3[2],
-            crc=row5[1], crs=row2[1],
-            cic=row4[1], cis=row4[3],
-        )
-
-        if system == "GPS":
-            eph = GPSEphemeris(
-                **common,
-                iode=row2[0], iodc=row7[3], tgd=row7[2],
-                gps_week=row6[2], codes_on_l2=row6[1], l2_p_flag=row6[3],
-                sv_accuracy=row7[0], sv_health=row7[1],
-                trans_time=row8[0], fit_interval=row8[1],
-            )
-        elif system == "BDS":
-            eph = BDSEphemeris(
-                **common,
-                aode=row2[0], aodc=row8[1],
-                tgd1=row7[2], tgd2=row7[3], sath1=row7[1],
-                bdt_week=row6[2], sv_accuracy=row7[0],
-                trans_time=row8[0],
-            )
-        else:
-            # 跳过暂不支持的系统
+        # 查表构造星历对象（未注册的系统跳过）
+        if system not in _EPH_BUILDERS:
             i += 8
             continue
+
+        common = _build_common_fields(system, prn, epoch, af0, af1, af2, rows)
+        _cls, builder = _EPH_BUILDERS[system]
+        eph = builder(common, rows)
 
         results.append(eph)
         i += 8
@@ -298,24 +339,29 @@ def parse_nav_file(path: str | Path) -> list[Ephemeris]:
 
     Returns:
         GPSEphemeris / BDSEphemeris 对象列表
+
+    Raises:
+        ValueError: 不支持的 RINEX 版本
     """
     path = Path(path)
     with open(path, "r") as f:
         lines = f.readlines()
 
     # 自动识别版本
-    version_line = lines[0]
-    version_str = version_line[0:9].strip()
+    version_str = lines[0][0:9].strip()
 
-    if version_str.startswith("2."):
-        # RINEX 2.x: 根据文件扩展名或用户指定判断系统
-        # .20n/.n → GPS, .16c/.c → BDS
-        system = _infer_system_from_path(path)
-        return parse_rinex2(lines, system=system)
-    elif version_str.startswith("3."):
-        return parse_rinex3(lines)
-    else:
-        raise ValueError(f"不支持的 RINEX 版本: {version_str}")
+    for prefix, parser_fn in _VERSION_PARSERS.items():
+        if version_str.startswith(prefix):
+            # RINEX 2.x 需要额外 system 参数
+            if prefix.startswith("2."):
+                system = _infer_system_from_path(path)
+                return parser_fn(lines, system=system)
+            return parser_fn(lines)
+
+    raise ValueError(
+        f"不支持的 RINEX 版本: {version_str}，"
+        f"已注册: {list(_VERSION_PARSERS.keys())}"
+    )
 
 
 def _infer_system_from_path(path: Path) -> str:
@@ -331,3 +377,14 @@ def _infer_system_from_path(path: Path) -> str:
         return "BDS"
     # 默认 GPS（.n, .20n 等）
     return "GPS"
+
+
+# ---------------------------------------------------------------------------
+# 自注册：内置版本解析器与星历构造器
+# ---------------------------------------------------------------------------
+
+register_version_parser("2.", parse_rinex2)
+register_version_parser("3.", parse_rinex3)
+
+register_eph_builder("GPS", GPSEphemeris, _build_gps_eph)
+register_eph_builder("BDS", BDSEphemeris, _build_bds_eph)

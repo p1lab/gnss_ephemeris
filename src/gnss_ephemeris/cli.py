@@ -12,8 +12,8 @@ import json
 import sys
 from pathlib import Path
 
-from gnss_ephemeris.rinex.parser import parse_nav_file
-from gnss_ephemeris.rinex.models import GPSEphemeris, BDSEphemeris
+from gnss_ephemeris.rinex.parser import parse_nav_file, _EPH_BUILDERS
+from gnss_ephemeris.rinex.models import Ephemeris
 from gnss_ephemeris.ephemeris import eph2pos
 
 
@@ -91,7 +91,7 @@ def cmd_compute(args: argparse.Namespace) -> None:
     _output_result(results, args.format)
 
 
-def _parse_epoch(epoch_str: str, eph: GPSEphemeris | BDSEphemeris) -> float:
+def _parse_epoch(epoch_str: str, eph: Ephemeris) -> float:
     """解析 ISO 格式历元字符串为 seconds of week.
 
     简化实现：仅支持 --epoch sow 数值（周内秒）。
@@ -150,7 +150,7 @@ def main() -> None:
     compute_cmd = subparsers.add_parser("compute", help="计算卫星位置与钟差")
     compute_cmd.add_argument("file", type=str, help="RINEX 导航电文文件路径")
     compute_cmd.add_argument("--system", type=str, default=None,
-                             help="卫星系统 (GPS/BDS)")
+                             help=f"卫星系统 ({'/'.join(_EPH_BUILDERS.keys())})")
     compute_cmd.add_argument("--prn", type=int, default=None,
                              help="卫星 PRN 号")
     compute_cmd.add_argument("--epoch", type=str, default=None,

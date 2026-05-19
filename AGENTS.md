@@ -85,14 +85,15 @@
 | `src/gnss_ephemeris/utils/kepler.py` | ✅ 已实现 | 开普勒方程求解器（公共） |
 | `src/gnss_ephemeris/utils/time.py` | ✅ 已实现 | 周内秒归一化 |
 | `src/gnss_ephemeris/rinex/models.py` | ✅ 已实现 | 数据契约层：`Ephemeris` / `GPSEphemeris` / `BDSEphemeris` |
-| `src/gnss_ephemeris/rinex/parser.py` | ✅ 已实现 | RINEX 2.x/3.x 全量解析 + 自动版本识别 |
+| `src/gnss_ephemeris/rinex/parser.py` | ✅ 已实现 | RINEX 2.x/3.x 全量解析 + 自动版本识别 + **注册表模式** |
 | `src/gnss_ephemeris/ephemeris/gps.py` | ✅ 已实现 | GPS 广播星历 → ECEF 位置/钟差 |
 | `src/gnss_ephemeris/ephemeris/bds.py` | ✅ 已实现 | BDS 广播星历 → ECEF 位置/钟差（含 GEO/MEO/IGSO） |
-| `src/gnss_ephemeris/ephemeris/__init__.py` | ✅ 已实现 | 统一入口 `eph2pos()`，自动分派 |
+| `src/gnss_ephemeris/ephemeris/__init__.py` | ✅ 已实现 | 统一入口 `eph2pos()` + **注册表模式**自动分派 |
 | `src/gnss_ephemeris/cli.py` | ✅ 已实现 | CLI 入口：`parse` / `compute` 子命令 |
 | `tests/test_utils.py` | ✅ 36 用例 | Fortran 转换、开普勒求解、时间归一化、常量验证 |
 | `tests/test_rinex.py` | ✅ 26 用例 | 契约层类型测试 + GPS/BDS R2/R3 解析回归 |
 | `tests/test_ephemeris.py` | ✅ 15 用例 | 分派测试 + GPS/BDS 解算 + 一致性验证 |
+| `tests/test_registry.py` | ✅ 7 用例 | 注册表测试 + OCP 验证 |
 
 > 注意：`pyproject.toml` 的 `[project.scripts]` 入口为 `gnss-eph = "gnss_ephemeris.cli:main"`。
 
@@ -218,15 +219,26 @@ class BDSEphemeris(Ephemeris):
 `ephemeris/` 的统一入口 `eph2pos(t_obs, eph)` 根据 `eph` 的类型分派：
 
 ```python
+# 注册表模式（Phase 5 已实现）
+_EPH2POS_REGISTRY: dict[type[Ephemeris], Callable] = {}
+
+def register_eph2pos(eph_cls, compute_fn):
+    _EPH2POS_REGISTRY[eph_cls] = compute_fn
+
 def eph2pos(t_obs: float, eph: Ephemeris) -> tuple:
-    if isinstance(eph, GPSEphemeris):
-        return gps_eph2pos(t_obs, eph)
-    elif isinstance(eph, BDSEphemeris):
-        return bds_eph2pos(t_obs, eph)
-    raise TypeError(f"不支持的星历类型: {type(eph)}")
+    for cls, fn in _EPH2POS_REGISTRY.items():
+        if isinstance(eph, cls):
+            return fn(t_obs, eph)
+    raise TypeError(f"不支持的星历类型: {type(eph).__name__}，已注册: ...")
+
+# 自注册
+register_eph2pos(GPSEphemeris, gps_eph2pos)
+register_eph2pos(BDSEphemeris, bds_eph2pos)
 ```
 
-未来扩展 Galileo 时：新增 `GalileoEphemeris(Ephemeris)` + `galileo_eph2pos()` + 在 `eph2pos` 中增加分支即可。
+未来扩展 Galileo 时：新增 `GalileoEphemeris(Ephemeris)` + `galileo_eph2pos()` + `register_eph2pos(GalileoEphemeris, galileo_eph2pos)`，**无需修改 `eph2pos()` 函数本身**（开闭原则）。
+
+同理，`parser.py` 中的版本解析器（`register_version_parser`）和星历构造器（`register_eph_builder`）也采用注册表模式。详见 `reports/phase5_ocp_refactor_spec.md`。
 
 ---
 
@@ -293,6 +305,13 @@ def eph2pos(t_obs: float, eph: Ephemeris) -> tuple:
 ### Phase 4：抽象正式模块 — ✅ 已完成
 
 > **总体思路**：自底向上迁移——先提取公共工具（无依赖），再迁移 RINEX 解析器（依赖 utils），再迁移星历解算（依赖 utils），最后实现 CLI（依赖全部模块）。每个子步骤完成后立即编写对应单元测试，用 MVP 相同的样例数据 + RTKLib 参考结果做回归验证。
+
+### Phase 5：开闭原则重构 — ✅ 已完成
+
+> **目标**：消除解析器与解算器中的 `if/elif` 硬编码分派，采用注册表模式使新增系统/版本时无需修改已有代码。
+>
+> 三个注册表：`_VERSION_PARSERS`（版本→解析函数）、`_EPH_BUILDERS`（系统→构造器）、`_EPH2POS_REGISTRY`（类型→解算函数）。
+> 详见 `reports/phase5_ocp_refactor_spec.md`。
 
 #### 4.1 `src/utils/` — 公共工具模块
 
